@@ -1,9 +1,12 @@
 import os
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import PlainTextResponse
 from openai import OpenAI
 from pydantic import BaseModel
 
@@ -27,6 +30,7 @@ detector = YOLOXDetector(
     interval_seconds=float(os.getenv("YOLOX_LOG_INTERVAL", DEFAULT_INTERVAL_SECONDS)),
 )
 openai_client = OpenAI()
+queries_log_path = detector.log_path.with_name("queries.txt")
 MODEL_INSTRUCTIONS = (
     "You help users identify where objects are in their home based on historical detections. "
     "Use the provided detection log entries as clues. When multiple objects share the same "
@@ -57,6 +61,15 @@ def load_detection_log_excerpt() -> str:
     )
 
 
+def log_chat_interaction(prompt: str, reply: str) -> None:
+    log_path = queries_log_path
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    with log_path.open("a", encoding="utf-8") as file:
+        file.write(f"{timestamp} | prompt: {prompt}\n")
+        file.write(f"{timestamp} | reply: {reply}\n")
+
+
 @app.on_event("startup")
 async def startup_event() -> None:
     detector.start()
@@ -66,8 +79,22 @@ async def startup_event() -> None:
 async def shutdown_event() -> None:
     detector.stop()
 
+@app.get("/hello")
+def hello_endpoint():
+    return 2
 
-@app.post("/chat", response_model=ChatResponse)
+@app.get("/logs")
+async def logs_endpoint() -> PlainTextResponse:
+    log_path = detector.log_path
+    if not log_path.exists():
+        raise HTTPException(status_code=404, detail="Detections log is not available.")
+
+    log_content = await run_in_threadpool(
+        lambda: log_path.read_text(encoding="utf-8", errors="ignore")
+    )
+    return PlainTextResponse(log_content, media_type="text/plain")
+
+@app.get("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest) -> ChatResponse:
     detection_context = await run_in_threadpool(load_detection_log_excerpt)
 
@@ -114,6 +141,8 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
         f"Response generated with detection context from {detector.log_path.name} "
         f"({min(len(detection_context), DETECTION_LOG_MAX_CHARS)} characters)."
     )
+
+    await run_in_threadpool(lambda: log_chat_interaction(request.prompt, reply_text))
 
     return ChatResponse(reply=reply_text, note=note)
 
