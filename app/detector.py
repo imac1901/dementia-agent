@@ -1,3 +1,4 @@
+import io
 import threading
 import time
 import urllib.request
@@ -5,6 +6,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+from openai import OpenAI
+
 
 import cv2
 import numpy as np
@@ -95,6 +98,7 @@ class YOLOXDetector:
         self._stop_event = threading.Event()
         self._stride_grid, self._stride_steps = self._build_grids()
         self._last_logged: float = 0.0
+        self.caption_client = OpenAI()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -145,9 +149,13 @@ class YOLOXDetector:
         return grid_concat, stride_concat
 
     def _run_loop(self) -> None:
+        """
+        Continuously capture frames, run YOLOX inference, render the visualization,
+        and log detections with context when behavior changes.
+        """
         cap = cv2.VideoCapture(self.capture_index, cv2.CAP_DSHOW)
         if not cap.isOpened():
-            self._write_log("camera_unavailable")
+            self._write_log("camera_unavailable\n")
             return
 
         cv2.namedWindow("YOLOX Live", cv2.WINDOW_NORMAL)
@@ -159,20 +167,34 @@ class YOLOXDetector:
                     time.sleep(0.5)
                     continue
 
+                # Store latest frame for context captioning
+                self._last_frame = frame.copy()
+
+                # Run object detection
                 detections = self._infer(frame)
+
+                # Render detections to live window
                 self._render_frame(frame.copy(), detections)
+
+                # Stop gracefully if user closes window
                 if cv2.getWindowProperty("YOLOX Live", cv2.WND_PROP_VISIBLE) < 1:
                     self._stop_event.set()
+                    break
+
+                # Log periodically (and only when needed)
                 now = time.time()
                 if now - self._last_logged >= self.interval_seconds:
                     self._log_detections(now, detections)
                     self._last_logged = now
-        finally:
+
             cap.release()
+
+        finally:
             try:
                 cv2.destroyAllWindows()
             except cv2.error:
                 pass
+
 
     def _infer(self, frame: np.ndarray) -> List[Detection]:
         if self.session is None:
@@ -268,28 +290,191 @@ class YOLOXDetector:
         ]
         return detections
 
+    # def _log_detections(self, timestamp: float, detections: Sequence[Detection]) -> None:
+    #     if not detections:
+    #         message = "none"
+    #     else:
+    #         grouped: Dict[str, List[float]] = {}
+    #         message_parts = []
+
+    #         for det in detections:
+    #             grouped.setdefault(det.label, []).append(det.confidence)
+    #             # Generate caption text for each detected object
+    #             caption_text = self._describe_context(
+    #                 frame=self._last_frame,  # store last frame for captioning
+    #                 detection=det
+    #             )
+    #             message_parts.append(
+    #                 f"{det.label} ({det.confidence:.2f}): {caption_text}"
+    #             )
+            
+    #         for label, scores in sorted(grouped.items()):
+    #             max_score = max(scores)
+    #             message_parts.append(f"{label} max={max_score:.2f}")
+    #         message = "; ".join(message_parts)
+
+    #     timestamp_str = datetime.fromtimestamp(timestamp).isoformat()
+    #     line = f"{timestamp_str} | {message}\n"
+    #     self._write_log(line)
+
     def _log_detections(self, timestamp: float, detections: Sequence[Detection]) -> None:
+        """
+        Log detections and caption only when new or meaningfully changed objects appear.
+        """
+        MOTION_TOLERANCE = 30  # pixels of allowed movement before re-captioning
+
+        # Convert detections to a compact summary: label + bbox center + size
+        current_summary = {}
+        for det in detections:
+            x1, y1, x2, y2 = det.bbox
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2  # center
+            w, h = x2 - x1, y2 - y1
+            current_summary[det.label] = (round(cx, 1), round(cy, 1), round(w, 1), round(h, 1))
+
+        # Compare with last detections to detect changes
+        caption_needed = False
+        last_summary = getattr(self, "_last_summary", {})
+
+        # 1️⃣ Check for new or missing labels
+        if set(current_summary.keys()) != set(last_summary.keys()):
+            caption_needed = True
+        else:
+            # 2️⃣ Check for significant motion
+            for label, (cx, cy, w, h) in current_summary.items():
+                prev_cx, prev_cy, prev_w, prev_h = last_summary[label]
+                dx = abs(cx - prev_cx)
+                dy = abs(cy - prev_cy)
+                dw = abs(w - prev_w)
+                dh = abs(h - prev_h)
+
+                if dx > MOTION_TOLERANCE or dy > MOTION_TOLERANCE or dw > 0.15 * w or dh > 0.15 * h:
+                    caption_needed = True
+                    break
+
+        # Store for next loop
+        self._last_summary = current_summary
+
         if not detections:
             message = "none"
         else:
             grouped: Dict[str, List[float]] = {}
+            message_parts = []
+
             for det in detections:
                 grouped.setdefault(det.label, []).append(det.confidence)
 
-            message_parts = []
+                if caption_needed:
+                    caption_text = self._describe_context(
+                        frame=self._last_frame,
+                        detection=det
+                    )
+                    message_parts.append(
+                        f"{det.label} ({det.confidence:.2f}): {caption_text}"
+                    )
+                else:
+                    message_parts.append(f"{det.label} ({det.confidence:.2f})")
+
             for label, scores in sorted(grouped.items()):
                 max_score = max(scores)
                 message_parts.append(f"{label} max={max_score:.2f}")
+
             message = "; ".join(message_parts)
 
-        timestamp_str = datetime.fromtimestamp(timestamp, tz=timezone.utc).isoformat()
+        # Log with local timezone
+
+        # Log with local timezone
+        from datetime import datetime
+        timestamp_str = datetime.fromtimestamp(timestamp).astimezone().isoformat()
+
         line = f"{timestamp_str} | {message}\n"
         self._write_log(line)
+
 
     def _write_log(self, content: str) -> None:
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         with self.log_path.open("a", encoding="utf-8") as file:
             file.write(content)
+
+    def _describe_context(self, frame: np.ndarray, detection) -> str:
+        """Generate a short caption for a single detection using GPT-4o."""
+        if frame is None or detection is None:
+            return "none"
+
+        try:
+            import io, base64, cv2
+
+            # Encode the cropped region or the full frame if desired
+            x1, y1, x2, y2 = map(int, detection.bbox)
+            h, w = frame.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            crop = frame[y1:y2, x1:x2]
+            if crop.size == 0:
+                return "(empty crop)"
+
+            success, buffer = cv2.imencode(".jpg", crop)
+            if not success:
+                return "encoding_failed"
+
+            # Convert to base64 so it’s JSON serializable
+            img_b64 = base64.b64encode(buffer).decode("utf-8")
+
+            # Describe what’s happening
+            prompt = f"You are viewing a camera frame. Describe what the {detection.label} is doing."
+
+            response = self.caption_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            #{"type": "image_url", "image_url": f"data:image/jpeg;base64,{img_b64}"},
+                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                        ],
+                    }
+                ],
+                max_tokens=50,
+            )
+
+            caption = response.choices[0].message.content.strip()
+            return caption or "none"
+
+        except Exception as e:
+            return f"caption service failed: {e}"
+
+
+
+
+    def _invoke_caption_service(
+        self,
+        prompt: str,
+        image_bytes: bytes,
+        detection: Detection,
+        full_frame_path: Path,  # pyright: ignore[reportUnusedParameter]
+    ) -> str:
+        # Use GPT-4o to generate a context description for an image crop.
+        try:
+            client = OpenAI()
+
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",  # or "gpt-4o" for full version
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image", "image": image_bytes},
+                        ],
+                    }
+                ],
+                max_tokens=150,
+            )
+
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            return f"caption service failed: {e}"
+
 
     def _render_frame(self, frame: np.ndarray, detections: Sequence[Detection]) -> None:
         for det in detections:
