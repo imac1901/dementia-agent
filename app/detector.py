@@ -1,73 +1,29 @@
 import io
+import queue
 import threading
 import time
-import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from openai import OpenAI
-
 
 import cv2
 import numpy as np
-import onnxruntime as ort
+from ultralytics import YOLO
 
 from .class_names import COCO_CLASS_NAMES
 
-MODEL_FILENAME = "object_detection_yolox_2022nov.onnx"
-MODEL_URL = (
-    "https://huggingface.co/opencv/object_detection_yolox/resolve/main/"
-    "object_detection_yolox_2022nov.onnx?download=1"
-)
-INPUT_SIZE = (640, 640)
-CONFIDENCE_THRESHOLD = 0.75
-OBJ_THRESHOLD = 0.5
-NMS_THRESHOLD = 0.45
-DEFAULT_INTERVAL_SECONDS = 1.0
-
-
-def ensure_file(path: Path, url: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if path.exists():
-        return
-    with urllib.request.urlopen(url) as response, path.open("wb") as out_file:
-        out_file.write(response.read())
-
-def nms(boxes: np.ndarray, scores: np.ndarray, threshold: float) -> List[int]:
-    if boxes.size == 0:
-        return []
-
-    x1 = boxes[:, 0]
-    y1 = boxes[:, 1]
-    x2 = boxes[:, 2]
-    y2 = boxes[:, 3]
-
-    areas = (x2 - x1) * (y2 - y1)
-    order = scores.argsort()[::-1]
-
-    keep: List[int] = []
-    while order.size > 0:
-        idx = order[0]
-        keep.append(idx)
-        if order.size == 1:
-            break
-
-        xx1 = np.maximum(x1[idx], x1[order[1:]])
-        yy1 = np.maximum(y1[idx], y1[order[1:]])
-        xx2 = np.minimum(x2[idx], x2[order[1:]])
-        yy2 = np.minimum(y2[idx], y2[order[1:]])
-
-        w = np.maximum(0.0, xx2 - xx1)
-        h = np.maximum(0.0, yy2 - yy1)
-        inter = w * h
-
-        iou = inter / (areas[idx] + areas[order[1:]] - inter + 1e-6)
-
-        inds = np.where(iou <= threshold)[0]
-        order = order[inds + 1]
-
-    return keep
+# YOLO11 model - will auto-download if not present
+# Options: 'yolo11n.pt' (fastest), 'yolo11s.pt', 'yolo11m.pt', 'yolo11l.pt', 'yolo11x.pt' (most accurate)
+MODEL_NAME = "yolo11n.pt"
+CONFIDENCE_THRESHOLD = 0.25  # Lower threshold since YOLO is more accurate
+IOU_THRESHOLD = 0.45  # IoU threshold for NMS (handled by YOLO)
+DEFAULT_INTERVAL_SECONDS = 2.0
+ALLOWED_CLASSES = {"cup", "cell phone", "remote"}
+# Minimum delay between API calls in seconds (helps avoid rate limits)
+MIN_API_DELAY_SECONDS = 3.0
 
 
 @dataclass
@@ -75,6 +31,21 @@ class Detection:
     label: str
     confidence: float
     bbox: Tuple[float, float, float, float]
+
+
+class CaptionRequestType(Enum):
+    CONTEXT = "context"  # Describe what object is doing
+    ROOM = "room"  # Identify which room
+
+
+@dataclass
+class CaptionRequest:
+    """Represents a queued caption request."""
+    request_type: CaptionRequestType
+    frame: np.ndarray
+    detection: Optional[Detection] = None
+    callback: Optional[Callable[[str], None]] = None  # Called with result
+    request_id: Optional[str] = None  # Unique ID for tracking results
 
 
 class YOLOXDetector:
@@ -85,72 +56,66 @@ class YOLOXDetector:
         interval_seconds: float = DEFAULT_INTERVAL_SECONDS,
         base_dir: Optional[Path] = None,
         log_filename: str = "detections.txt",
+        model_name: str = MODEL_NAME,
     ) -> None:
         self.capture_index = capture_index
         self.interval_seconds = interval_seconds
         self.base_dir = base_dir or Path(__file__).resolve().parent
-        self.model_path = self.base_dir / "models" / MODEL_FILENAME
+        self.model_name = model_name
         self.log_path = self.base_dir / "logs" / log_filename
-        self.session: Optional[ort.InferenceSession] = None
-        self._input_name: Optional[str] = None
-        self._output_names: Optional[List[str]] = None
+        self.model: Optional[YOLO] = None
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._stride_grid, self._stride_steps = self._build_grids()
         self._last_logged: float = 0.0
+        self._captioned_labels: set[str] = set()
         self.caption_client = OpenAI()
+        
+        # Queue and worker thread for throttled API calls
+        self._caption_queue: queue.Queue[Optional[CaptionRequest]] = queue.Queue()
+        self._caption_worker_thread: Optional[threading.Thread] = None
+        self._last_api_call_time: float = 0.0
+        self._pending_results: Dict[str, Tuple[threading.Event, Optional[str]]] = {}  # Store (event, result) by request ID
+        self._request_counter: int = 0
+        self._result_lock = threading.Lock()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
-        ensure_file(self.model_path, MODEL_URL)
-        self.session = self._create_session()
+        # Load YOLO model (will auto-download if not present)
+        self.model = YOLO(self.model_name)
         self.log_path.parent.mkdir(parents=True, exist_ok=True)
         self._stop_event.clear()
-        self._thread = threading.Thread(target=self._run_loop, name="YOLOXWorker", daemon=True)
+        self._thread = threading.Thread(target=self._run_loop, name="YOLOWorker", daemon=True)
         self._thread.start()
+        
+        # Start caption worker thread if not already running
+        if self._caption_worker_thread is None or not self._caption_worker_thread.is_alive():
+            self._caption_worker_thread = threading.Thread(
+                target=self._caption_worker_loop, 
+                name="CaptionWorker", 
+                daemon=True
+            )
+            self._caption_worker_thread.start()
 
     def stop(self) -> None:
         self._stop_event.set()
+        # Signal caption worker to stop
+        self._caption_queue.put(None)
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5.0)
         self._thread = None
+        if self._caption_worker_thread and self._caption_worker_thread.is_alive():
+            self._caption_worker_thread.join(timeout=5.0)
+        self._caption_worker_thread = None
         try:
             cv2.destroyAllWindows()
         except cv2.error:
             pass
 
-    def _create_session(self) -> ort.InferenceSession:
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        available = [p for p in providers if p in ort.get_available_providers()]
-        session = ort.InferenceSession(
-            str(self.model_path),
-            providers=available or ["CPUExecutionProvider"],
-        )
-        self._input_name = session.get_inputs()[0].name
-        self._output_names = [output.name for output in session.get_outputs()]
-        return session
-
-    def _build_grids(self) -> Tuple[np.ndarray, np.ndarray]:
-        strides = [8, 16, 32]
-        grid_list = []
-        stride_list = []
-        input_h, input_w = INPUT_SIZE
-        for stride in strides:
-            hs = input_h // stride
-            ws = input_w // stride
-            ys, xs = np.meshgrid(np.arange(hs), np.arange(ws))
-            grid = np.stack((xs, ys), axis=-1).reshape(-1, 2)
-            grid_list.append(grid)
-            stride_list.append(np.full((grid.shape[0], 1), stride))
-
-        grid_concat = np.concatenate(grid_list, axis=0).astype(np.float32)
-        stride_concat = np.concatenate(stride_list, axis=0).astype(np.float32)
-        return grid_concat, stride_concat
 
     def _run_loop(self) -> None:
         """
-        Continuously capture frames, run YOLOX inference, render the visualization,
+        Continuously capture frames, run YOLO inference, render the visualization,
         and log detections with context when behavior changes.
         """
         cap = cv2.VideoCapture(self.capture_index, cv2.CAP_DSHOW)
@@ -158,7 +123,7 @@ class YOLOXDetector:
             self._write_log("camera_unavailable\n")
             return
 
-        cv2.namedWindow("YOLOX Live", cv2.WINDOW_NORMAL)
+        cv2.namedWindow("YOLO Live", cv2.WINDOW_NORMAL)
 
         try:
             while not self._stop_event.is_set():
@@ -170,14 +135,14 @@ class YOLOXDetector:
                 # Store latest frame for context captioning
                 self._last_frame = frame.copy()
 
-                # Run object detection
+                # Run object detection (already filtered to ALLOWED_CLASSES in _infer)
                 detections = self._infer(frame)
 
                 # Render detections to live window
                 self._render_frame(frame.copy(), detections)
 
                 # Stop gracefully if user closes window
-                if cv2.getWindowProperty("YOLOX Live", cv2.WND_PROP_VISIBLE) < 1:
+                if cv2.getWindowProperty("YOLO Live", cv2.WND_PROP_VISIBLE) < 1:
                     self._stop_event.set()
                     break
 
@@ -197,97 +162,65 @@ class YOLOXDetector:
 
 
     def _infer(self, frame: np.ndarray) -> List[Detection]:
-        if self.session is None:
-            raise RuntimeError("ONNX runtime session is not initialized")
+        """Run YOLO inference on a frame and convert results to Detection objects."""
+        if self.model is None:
+            raise RuntimeError("YOLO model is not initialized")
 
-        blob, ratio = self._preprocess(frame)
-        if self._input_name is None or self._output_names is None:
-            raise RuntimeError("ONNX runtime session is not configured correctly")
+        # Run inference with YOLO
+        results = self.model(
+            frame,
+            conf=CONFIDENCE_THRESHOLD,
+            iou=IOU_THRESHOLD,
+            verbose=False,
+        )
 
-        outputs = self.session.run(self._output_names, {self._input_name: blob})[0]
-        detections = self._postprocess(outputs, ratio, frame.shape[:2])
-        return detections
+        detections: List[Detection] = []
+        
+        # YOLO returns Results objects, get the first one (single image)
+        if len(results) == 0:
+            return detections
 
-    def _preprocess(self, frame: np.ndarray) -> Tuple[np.ndarray, float]:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.float32)
-        padded = np.ones((INPUT_SIZE[0], INPUT_SIZE[1], 3), dtype=np.float32) * 114.0
+        result = results[0]
+        
+        # Check if we have any detections
+        if result.boxes is None or len(result.boxes) == 0:
+            return detections
 
-        ratio = min(INPUT_SIZE[0] / rgb.shape[0], INPUT_SIZE[1] / rgb.shape[1])
-        resized = cv2.resize(
-            rgb,
-            (int(rgb.shape[1] * ratio), int(rgb.shape[0] * ratio)),
-            interpolation=cv2.INTER_LINEAR,
-        ).astype(np.float32)
+        # Get boxes and class information
+        boxes = result.boxes.xyxy.cpu().numpy()  # x1, y1, x2, y2 format
+        confidences = result.boxes.conf.cpu().numpy()
+        class_ids = result.boxes.cls.cpu().numpy().astype(int)
+        class_names_dict = result.names  # YOLO's class name mapping (dict)
 
-        padded[: resized.shape[0], : resized.shape[1]] = resized
+        # Convert YOLO results to Detection objects
+        # Map YOLO class IDs to COCO class names (YOLO uses COCO classes)
+        for box, conf, cls_id in zip(boxes, confidences, class_ids):
+            # Get class name from YOLO (names is a dict mapping class_id to name)
+            if isinstance(class_names_dict, dict):
+                yolo_class_name = class_names_dict.get(int(cls_id), f"class_{cls_id}")
+            else:
+                # Fallback if it's a list instead
+                yolo_class_name = class_names_dict[int(cls_id)] if int(cls_id) < len(class_names_dict) else f"class_{cls_id}"
+            
+            # Map YOLO class names to COCO class names if needed
+            # YOLO uses the same COCO classes, so we can use the name directly
+            # but ensure it matches our COCO_CLASS_NAMES format
+            class_name = yolo_class_name
+            
+            # Handle any naming differences (e.g., "cell phone" vs "cellphone")
+            if class_name == "cellphone":
+                class_name = "cell phone"
+            
+            # Only include allowed classes
+            if class_name in ALLOWED_CLASSES:
+                detections.append(
+                    Detection(
+                        label=class_name,
+                        confidence=float(conf),
+                        bbox=(float(box[0]), float(box[1]), float(box[2]), float(box[3])),
+                    )
+                )
 
-        blob = np.transpose(padded, (2, 0, 1))[np.newaxis, :, :, :]
-        return blob, ratio
-
-    def _postprocess(
-        self,
-        outputs: np.ndarray,
-        ratio: float,
-        original_shape: Tuple[int, int],
-    ) -> List[Detection]:
-        output = outputs[0] if outputs.ndim == 3 else outputs
-        num_classes = output.shape[-1] - 5
-        predictions = output.reshape(-1, num_classes + 5)
-
-        predictions[:, 0:2] = (predictions[:, 0:2] + self._stride_grid) * self._stride_steps
-        predictions[:, 2:4] = np.exp(predictions[:, 2:4]) * self._stride_steps
-
-        boxes = predictions[:, 0:4].copy()
-        boxes[:, 0] -= boxes[:, 2] * 0.5
-        boxes[:, 1] -= boxes[:, 3] * 0.5
-        boxes[:, 2] = boxes[:, 0] + boxes[:, 2]
-        boxes[:, 3] = boxes[:, 1] + boxes[:, 3]
-
-        boxes = boxes / ratio
-
-        h, w = original_shape
-        boxes[:, 0] = np.clip(boxes[:, 0], 0, w)
-        boxes[:, 1] = np.clip(boxes[:, 1], 0, h)
-        boxes[:, 2] = np.clip(boxes[:, 2], 0, w)
-        boxes[:, 3] = np.clip(boxes[:, 3], 0, h)
-
-        obj_scores = predictions[:, 4]
-        class_scores = predictions[:, 5:]
-
-        obj_mask = obj_scores > OBJ_THRESHOLD
-        if not np.any(obj_mask):
-            return []
-
-        boxes = boxes[obj_mask]
-        class_scores = class_scores[obj_mask]
-        obj_scores = obj_scores[obj_mask]
-
-        class_ids = np.argmax(class_scores, axis=1)
-        class_confidences = class_scores[np.arange(class_scores.shape[0]), class_ids]
-        scores = obj_scores * class_confidences
-
-        conf_mask = scores > CONFIDENCE_THRESHOLD
-        boxes = boxes[conf_mask]
-        scores = scores[conf_mask]
-        class_ids = class_ids[conf_mask]
-
-        if boxes.size == 0:
-            return []
-
-        keep = nms(boxes, scores, NMS_THRESHOLD)
-
-        class_names = COCO_CLASS_NAMES[:num_classes]
-
-        detections = [
-            Detection(
-                label=class_names[class_ids[idx]]
-                if class_ids[idx] < len(class_names)
-                else f"class_{class_ids[idx]}",
-                confidence=float(scores[idx]),
-                bbox=tuple(map(float, boxes[idx])),
-            )
-            for idx in keep
-        ]
         return detections
 
     # def _log_detections(self, timestamp: float, detections: Sequence[Detection]) -> None:
@@ -363,14 +296,23 @@ class YOLOXDetector:
             for det in detections:
                 grouped.setdefault(det.label, []).append(det.confidence)
 
-                if caption_needed:
+                should_caption = (
+                    caption_needed
+                    and det.label == "remote"
+                    and det.label not in self._captioned_labels
+                )
+
+                if should_caption:
                     caption_text = self._describe_context(
                         frame=self._last_frame,
                         detection=det
                     )
+                    room = self._describe_room(self._last_frame)
                     message_parts.append(
-                        f"{det.label} ({det.confidence:.2f}): {caption_text}"
+                        f"{det.label} ({det.confidence:.2f}): {caption_text}; room={room}"
                     )
+                    self._captioned_labels.add(det.label)
+
                 else:
                     message_parts.append(f"{det.label} ({det.confidence:.2f})")
 
@@ -395,53 +337,224 @@ class YOLOXDetector:
         with self.log_path.open("a", encoding="utf-8") as file:
             file.write(content)
 
-    def _describe_context(self, frame: np.ndarray, detection) -> str:
-        """Generate a short caption for a single detection using GPT-4o."""
+    def _caption_worker_loop(self) -> None:
+        """Worker thread that processes caption requests from the queue with throttling."""
+        while not self._stop_event.is_set():
+            try:
+                # Get next request (with timeout to check stop event)
+                request = self._caption_queue.get(timeout=1.0)
+                
+                # None is a sentinel value to stop the worker
+                if request is None:
+                    break
+                
+                # Enforce minimum delay between API calls
+                now = time.time()
+                time_since_last_call = now - self._last_api_call_time
+                if time_since_last_call < MIN_API_DELAY_SECONDS:
+                    sleep_time = MIN_API_DELAY_SECONDS - time_since_last_call
+                    time.sleep(sleep_time)
+                
+                # Process the request
+                result = None
+                request_id = None
+                
+                try:
+                    if request.request_type == CaptionRequestType.CONTEXT:
+                        result = self._process_context_request(request)
+                    elif request.request_type == CaptionRequestType.ROOM:
+                        result = self._process_room_request(request)
+                    
+                    # Store result and notify waiting threads
+                    with self._result_lock:
+                        if request.request_id and request.request_id in self._pending_results:
+                            event, _ = self._pending_results[request.request_id]
+                            self._pending_results[request.request_id] = (event, result)
+                            event.set()
+                    
+                    # Call callback if provided
+                    if request.callback and result:
+                        request.callback(result)
+                        
+                except Exception as e:
+                    error_msg = f"caption service failed: {e}"
+                    with self._result_lock:
+                        if request.request_id and request.request_id in self._pending_results:
+                            event, _ = self._pending_results[request.request_id]
+                            self._pending_results[request.request_id] = (event, error_msg)
+                            event.set()
+                    if request.callback:
+                        request.callback(error_msg)
+                
+                # Update last API call time
+                self._last_api_call_time = time.time()
+                
+            except queue.Empty:
+                # Timeout - continue loop to check stop event
+                continue
+            except Exception as e:
+                # Log error but continue processing
+                print(f"Caption worker error: {e}")
+                continue
+
+    def _process_context_request(self, request: CaptionRequest) -> str:
+        """Process a context caption request (what object is doing)."""
+        if request.detection is None:
+            return "none"
+        
+        frame = request.frame
+        detection = request.detection
+        
+        import base64
+        import cv2
+        
+        # Encode the cropped region
+        x1, y1, x2, y2 = map(int, detection.bbox)
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return "(empty crop)"
+        
+        success, buffer = cv2.imencode(".jpg", crop)
+        if not success:
+            return "encoding_failed"
+        
+        img_b64 = base64.b64encode(buffer).decode("utf-8")
+        prompt = f"You are viewing a camera frame. Describe what the {detection.label} is doing."
+        
+        response = self.caption_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                    ],
+                }
+            ],
+            max_tokens=50,
+        )
+        
+        caption = response.choices[0].message.content.strip()
+        return caption or "none"
+
+    def _process_room_request(self, request: CaptionRequest) -> str:
+        """Process a room identification request."""
+        frame = request.frame
+        
+        import base64
+        import cv2
+        
+        success, buffer = cv2.imencode(".jpg", frame)
+        if not success:
+            return "unknown"
+        
+        img_b64 = base64.b64encode(buffer).decode("utf-8")
+        prompt = (
+            "Which room of a home is this image most likely taken in? "
+            "Choose ONE word from: kitchen, living room, bedroom, bathroom, "
+            "office, hallway, unknown. If unsure, say 'unknown'."
+        )
+        
+        response = self.caption_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
+                    ],
+                }
+            ],
+            max_tokens=5,
+        )
+        
+        text = response.choices[0].message.content.strip().lower()
+        return text.split()[0] if text else "unknown"
+
+    def _describe_room(self, frame: np.ndarray, timeout: float = 10.0) -> str:
+        """Classify which room the full frame is taken in using GPT-4o vision.
+        
+        Queues the request and waits for result with timeout.
+        Returns 'unknown' if timeout or error occurs.
+        """
+        if frame is None:
+            return "unknown"
+        
+        # Create request ID
+        with self._result_lock:
+            self._request_counter += 1
+            request_id = f"room_{self._request_counter}"
+            event = threading.Event()
+            self._pending_results[request_id] = (event, None)
+        
+        # Create and queue request
+        request = CaptionRequest(
+            request_type=CaptionRequestType.ROOM,
+            frame=frame.copy(),  # Copy to avoid frame being overwritten
+            detection=None,
+            request_id=request_id,
+        )
+        self._caption_queue.put(request)
+        
+        # Wait for result with timeout
+        if event.wait(timeout=timeout):
+            with self._result_lock:
+                if request_id in self._pending_results:
+                    _, result = self._pending_results[request_id]
+                    del self._pending_results[request_id]
+                    return result or "unknown"
+        
+        # Timeout or result not found
+        with self._result_lock:
+            if request_id in self._pending_results:
+                del self._pending_results[request_id]
+        return "unknown"
+
+
+
+    def _describe_context(self, frame: np.ndarray, detection, timeout: float = 10.0) -> str:
+        """Generate a short caption for a single detection using GPT-4o.
+        
+        Queues the request and waits for result with timeout.
+        Returns 'none' if timeout or error occurs.
+        """
         if frame is None or detection is None:
             return "none"
-
-        try:
-            import io, base64, cv2
-
-            # Encode the cropped region or the full frame if desired
-            x1, y1, x2, y2 = map(int, detection.bbox)
-            h, w = frame.shape[:2]
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
-            crop = frame[y1:y2, x1:x2]
-            if crop.size == 0:
-                return "(empty crop)"
-
-            success, buffer = cv2.imencode(".jpg", crop)
-            if not success:
-                return "encoding_failed"
-
-            # Convert to base64 so it’s JSON serializable
-            img_b64 = base64.b64encode(buffer).decode("utf-8")
-
-            # Describe what’s happening
-            prompt = f"You are viewing a camera frame. Describe what the {detection.label} is doing."
-
-            response = self.caption_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            #{"type": "image_url", "image_url": f"data:image/jpeg;base64,{img_b64}"},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}},
-                        ],
-                    }
-                ],
-                max_tokens=50,
-            )
-
-            caption = response.choices[0].message.content.strip()
-            return caption or "none"
-
-        except Exception as e:
-            return f"caption service failed: {e}"
+        
+        # Create request ID
+        with self._result_lock:
+            self._request_counter += 1
+            request_id = f"context_{self._request_counter}"
+            event = threading.Event()
+            self._pending_results[request_id] = (event, None)
+        
+        # Create and queue request
+        request = CaptionRequest(
+            request_type=CaptionRequestType.CONTEXT,
+            frame=frame.copy(),  # Copy to avoid frame being overwritten
+            detection=detection,
+            request_id=request_id,
+        )
+        self._caption_queue.put(request)
+        
+        # Wait for result with timeout
+        if event.wait(timeout=timeout):
+            with self._result_lock:
+                if request_id in self._pending_results:
+                    _, result = self._pending_results[request_id]
+                    del self._pending_results[request_id]
+                    return result or "none"
+        
+        # Timeout or result not found
+        with self._result_lock:
+            if request_id in self._pending_results:
+                del self._pending_results[request_id]
+        return "none"
 
 
 
@@ -498,7 +611,7 @@ class YOLOXDetector:
                 cv2.LINE_AA,
             )
 
-        cv2.imshow("YOLOX Live", frame)
+        cv2.imshow("YOLO Live", frame)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             self._stop_event.set()
